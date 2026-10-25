@@ -103,17 +103,30 @@ export function ProductsScreen() {
     let parseErrors = 0;
 
     for (const cells of dataRows) {
-      const priceCell = cells[columns.price] ?? "";
-      const priceCents = parseTRY(priceCell);
-      if (priceCell.trim() !== "" && priceCents === null) {
+      const sellCell = cells[columns.sell] ?? "";
+      const sellCents = parseTRY(sellCell);
+      if (sellCell.trim() !== "" && sellCents === null) {
         parseErrors += 1;
         continue;
+      }
+
+      // Maliyet sütunu yoksa 0 kabul edilir (eski CSV'lerle uyumluluk).
+      let costCents = 0;
+      if (columns.cost >= 0) {
+        const costCell = cells[columns.cost] ?? "";
+        const parsedCost = parseTRY(costCell);
+        if (costCell.trim() !== "" && parsedCost === null) {
+          parseErrors += 1;
+          continue;
+        }
+        costCents = parsedCost ?? 0;
       }
 
       productsToImport.push({
         barcode: (cells[columns.barcode] ?? "").trim() || null,
         name: (cells[columns.name] ?? "").trim(),
-        price_cents: priceCents ?? 0,
+        cost_cents: costCents,
+        sell_cents: sellCents ?? 0,
         stock: Number.parseInt(cells[columns.stock] ?? "0", 10) || 0,
       });
     }
@@ -127,7 +140,7 @@ export function ProductsScreen() {
     try {
       summary = await importProducts(productsToImport);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "İçe aktarma başarısız.");
+      setError(caught instanceof Error ? caught.message : String(caught));
       return;
     }
 
@@ -201,7 +214,8 @@ export function ProductsScreen() {
             <tr>
               <th>Barkod</th>
               <th>Ürün Adı</th>
-              <th className="num">Fiyat</th>
+              <th className="num">Maliyet</th>
+              <th className="num">Satış</th>
               <th className="num">Stok</th>
               <th />
             </tr>
@@ -211,7 +225,8 @@ export function ProductsScreen() {
               <tr key={product.id} className={product.stock < 0 ? "row-negative" : undefined}>
                 <td className="mono">{product.barcode ?? "—"}</td>
                 <td>{product.name}</td>
-                <td className="num">{formatTRY(product.price_cents)}</td>
+                <td className="num muted">{formatTRY(product.cost_cents)}</td>
+                <td className="num strong">{formatTRY(product.sell_cents)}</td>
                 <td className={`num ${product.stock <= 0 ? "stock-low" : ""}`}>{product.stock}</td>
                 <td className="row-actions">
                   <button
@@ -244,10 +259,10 @@ export function ProductsScreen() {
           >
             <h2>CSV ile içe aktar</h2>
             <p className="hint">
-              Beklenen sütunlar: <strong>barkod ; ürün adı ; fiyat ; stok</strong>. Ayraç olarak
-              noktalı virgül, virgül veya sekme kullanılabilir. Fiyat Türkçe biçimde girilir (ör.{" "}
-              <span className="mono">12,50</span>). Başlık satırı varsa sütunlar adlandırılarak
-              eşleştirilir.
+              Beklenen sütunlar: <strong>barkod ; ürün adı ; maliyet ; satış fiyatı ; stok</strong>.
+              Ayraç olarak noktalı virgül, virgül veya sekme kullanılabilir. Tutarlar Türkçe biçimde
+              girilir (ör. <span className="mono">12,50</span>). Başlık satırı varsa sütunlar
+              adlarıyla eşleştirilir; maliyet sütunu yoksa 0 kabul edilir.
             </p>
 
             <textarea
@@ -255,7 +270,9 @@ export function ProductsScreen() {
               value={csvText}
               onChange={(event) => setCsvText(event.target.value)}
               rows={8}
-              placeholder={"barkod;ürün adı;fiyat;stok\n8690500000001;Çay 500g;12,50;20"}
+              placeholder={
+                "barkod;ürün adı;maliyet;satış fiyatı;stok\n8690500000001;Çay 500g;8,00;12,50;20"
+              }
               spellCheck={false}
             />
 

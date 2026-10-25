@@ -68,7 +68,7 @@ export default function App() {
           ))}
         </nav>
 
-        <main className="content">
+        <main className={`content ${tab === "satis" ? "content-fixed" : ""}`}>
           {tab === "satis" ? <SellScreen /> : null}
           {tab === "urunler" ? <ProductsScreen /> : null}
           {tab === "gecmis" ? <SalesHistoryScreen /> : null}

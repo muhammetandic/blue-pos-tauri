@@ -13,8 +13,9 @@ export async function checkout(input: CheckoutInput): Promise<CheckoutResult> {
     args: {
       lines: input.lines.map((line) => ({
         productId: line.product_id,
+        priceId: line.price_id,
         name: line.name,
-        priceCents: line.price_cents,
+        sellCents: line.sell_cents,
         qty: line.qty,
       })),
       method: input.method,
@@ -26,7 +27,7 @@ export async function checkout(input: CheckoutInput): Promise<CheckoutResult> {
 
 /** Sepetin toplamını kuruş cinsinden hesaplar. */
 export function cartTotal(lines: CartLine[]): number {
-  return lines.reduce((sum, line) => sum + line.price_cents * line.qty, 0);
+  return lines.reduce((sum, line) => sum + line.sell_cents * line.qty, 0);
 }
 
 /** Bugün oluşturulan satışlar. SQLite datetime('now') yerel saatle kaydeder. */

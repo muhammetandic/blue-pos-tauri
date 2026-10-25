@@ -14,15 +14,19 @@ export interface CartState {
 }
 
 export type CartAction =
-  | { type: "addProduct"; product: Product }
-  | { type: "addAdHoc"; barcode: string }
-  | { type: "inc"; key: string }
-  | { type: "dec"; key: string }
+  | { type: "addProduct"; product: Product; qty?: number }
+  | { type: "addAdHoc"; barcode: string; qty?: number }
   | { type: "remove"; key: string }
   | { type: "clearUnknown" }
   | { type: "clear" };
 
 export const initialState: CartState = { lines: [], unknownBarcode: null };
+
+/** Eklenecek adet: 1'den küçük veya geçersiz değerler 1 kabul edilir. */
+function quantityOf(value: number | undefined): number {
+  if (value === undefined || !Number.isSafeInteger(value) || value < 1) return 1;
+  return value;
+}
 
 function productKey(productId: number): string {
   return `p${productId}`;
@@ -36,12 +40,13 @@ export function cartReducer(state: CartState, action: CartAction): CartState {
   switch (action.type) {
     case "addProduct": {
       const key = productKey(action.product.id);
+      const qty = quantityOf(action.qty);
       const existing = state.lines.find((line) => line.key === key);
       if (existing) {
         return {
           ...state,
           lines: state.lines.map((line) =>
-            line.key === key ? { ...line, qty: line.qty + 1 } : line,
+            line.key === key ? { ...line, qty: line.qty + qty } : line,
           ),
         };
       }
@@ -53,9 +58,10 @@ export function cartReducer(state: CartState, action: CartAction): CartState {
           {
             key,
             product_id: action.product.id,
+            price_id: action.product.price_id,
             name: action.product.name,
-            price_cents: action.product.price_cents,
-            qty: 1,
+            sell_cents: action.product.sell_cents,
+            qty,
           },
         ],
       };
@@ -63,13 +69,14 @@ export function cartReducer(state: CartState, action: CartAction): CartState {
 
     case "addAdHoc": {
       const key = adHocKey(action.barcode);
+      const qty = quantityOf(action.qty);
       const existing = state.lines.find((line) => line.key === key);
       if (existing) {
         return {
           ...state,
           unknownBarcode: action.barcode,
           lines: state.lines.map((line) =>
-            line.key === key ? { ...line, qty: line.qty + 1 } : line,
+            line.key === key ? { ...line, qty: line.qty + qty } : line,
           ),
         };
       }
@@ -81,30 +88,12 @@ export function cartReducer(state: CartState, action: CartAction): CartState {
           {
             key,
             product_id: null,
+            price_id: null,
             name: `Bilinmeyen barkod ${action.barcode}`,
-            price_cents: 0,
-            qty: 1,
+            sell_cents: 0,
+            qty,
           },
         ],
-      };
-    }
-
-    case "inc":
-      return {
-        ...state,
-        lines: state.lines.map((line) =>
-          line.key === action.key ? { ...line, qty: line.qty + 1 } : line,
-        ),
-      };
-
-    case "dec": {
-      // Adet sıfıra düşerse satır tamamen kaldırılır.
-      return {
-        ...state,
-        lines: state.lines.flatMap((line) => {
-          if (line.key !== action.key) return [line];
-          return line.qty > 1 ? [{ ...line, qty: line.qty - 1 }] : [];
-        }),
       };
     }
 
@@ -134,7 +123,7 @@ export function CartProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(cartReducer, initialState);
 
   const value = useMemo<CartContextValue>(() => {
-    const total_cents = state.lines.reduce((sum, line) => sum + line.price_cents * line.qty, 0);
+    const total_cents = state.lines.reduce((sum, line) => sum + line.sell_cents * line.qty, 0);
     const item_count = state.lines.reduce((sum, line) => sum + line.qty, 0);
     return { ...state, dispatch, total_cents, item_count };
   }, [state]);

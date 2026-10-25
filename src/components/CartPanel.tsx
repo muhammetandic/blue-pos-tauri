@@ -8,41 +8,21 @@ interface CartPanelProps {
 
 function Line({ line }: { line: CartLine }) {
   const { dispatch } = useCart();
-  const sum = line.price_cents * line.qty;
+  const sum = line.sell_cents * line.qty;
 
   return (
     <li className={`cart-line ${line.product_id === null ? "ad-hoc" : ""}`}>
-      <div className="cart-line-main">
-        <span className="cart-line-name">{line.name}</span>
-        <span className="cart-line-sum">{formatTRY(sum)}</span>
-      </div>
-      <div className="cart-line-controls">
-        <button
-          type="button"
-          className="btn tiny"
-          aria-label={`${line.name} adedini azalt`}
-          onClick={() => dispatch({ type: "dec", key: line.key })}
-        >
-          −
-        </button>
-        <span className="cart-line-qty">{line.qty}</span>
-        <button
-          type="button"
-          className="btn tiny"
-          aria-label={`${line.name} adedini artır`}
-          onClick={() => dispatch({ type: "inc", key: line.key })}
-        >
-          +
-        </button>
-        <button
-          type="button"
-          className="btn tiny danger"
-          aria-label={`${line.name} satırını kaldır`}
-          onClick={() => dispatch({ type: "remove", key: line.key })}
-        >
-          Sil
-        </button>
-      </div>
+      <span className="cart-line-name">{line.name}</span>
+      <span className="cart-line-qty">{line.qty}</span>
+      <span className="cart-line-sum">{formatTRY(sum)}</span>
+      <button
+        type="button"
+        className="btn tiny danger"
+        aria-label={`${line.name} satırını kaldır`}
+        onClick={() => dispatch({ type: "remove", key: line.key })}
+      >
+        Sil
+      </button>
     </li>
   );
 }
@@ -71,7 +51,7 @@ export function CartPanel({ onCheckout }: CartPanelProps) {
           <span>Bilinmeyen barkod: {unknownBarcode}</span>
           <button
             type="button"
-            className="btn tiny ghost"
+            className="btn tiny ghost push-right"
             onClick={() => dispatch({ type: "clearUnknown" })}
           >
             Tamam

@@ -26,7 +26,7 @@ export function ProductGrid({ products, onPick }: ProductGridProps) {
           title={product.barcode ?? product.name}
         >
           <span className="product-name">{product.name}</span>
-          <span className="product-price">{formatTRY(product.price_cents)}</span>
+          <span className="product-price">{formatTRY(product.sell_cents)}</span>
           <span className={`product-stock ${product.stock < 0 ? "negative" : ""}`}>
             Stok: {product.stock}
           </span>

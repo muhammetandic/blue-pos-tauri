@@ -86,9 +86,18 @@ const HEADER_CELLS = new Set([
   "isim",
   "adı",
   "adi",
+  "maliyet",
+  "alış",
+  "alis",
+  "alış fiyatı",
+  "alis fiyati",
   "fiyat",
   "fiyatı",
   "fiyati",
+  "satış",
+  "satis",
+  "satış fiyatı",
+  "satis fiyati",
   "stok",
   "adet",
   "miktar",
@@ -101,17 +110,26 @@ export function looksLikeHeader(cells: string[]): boolean {
 }
 
 /**
- * Sütun sırasını başlıktan çıkarır; yokta varsayılan sırayı kullanır.
- * Beklenen varsayılan: barkod, ad, fiyat, stok
+ * Sütun sırasını başlıktan çıkarır; yoksa varsayılan sırayı kullanır.
+ * Beklenen varsayılan: barkod, ad, satış fiyatı, stok.
+ * Maliyet sütunu yalnızca başlıkta adlandırılırsa okunur (`cost: -1`).
  */
 export interface ColumnMap {
   barcode: number;
   name: number;
-  price: number;
+  /** -1 ise maliyet sütunu yoktur; 0 kabul edilir. */
+  cost: number;
+  sell: number;
   stock: number;
 }
 
-export const DEFAULT_COLUMNS: ColumnMap = { barcode: 0, name: 1, price: 2, stock: 3 };
+export const DEFAULT_COLUMNS: ColumnMap = {
+  barcode: 0,
+  name: 1,
+  cost: -1,
+  sell: 2,
+  stock: 3,
+};
 
 export function resolveColumns(header: string[]): ColumnMap {
   const columns: ColumnMap = { ...DEFAULT_COLUMNS };
@@ -119,8 +137,25 @@ export function resolveColumns(header: string[]): ColumnMap {
 
   normalized.forEach((cell, index) => {
     if (cell === "barkod") columns.barcode = index;
-    else if (cell === "fiyat" || cell === "fiyatı" || cell === "fiyati") columns.price = index;
-    else if (cell === "stok" || cell === "adet" || cell === "miktar") columns.stock = index;
+    else if (
+      cell === "maliyet" ||
+      cell === "alış" ||
+      cell === "alis" ||
+      cell === "alış fiyatı" ||
+      cell === "alis fiyati"
+    ) {
+      columns.cost = index;
+    } else if (
+      cell === "fiyat" ||
+      cell === "fiyatı" ||
+      cell === "fiyati" ||
+      cell === "satış" ||
+      cell === "satis" ||
+      cell === "satış fiyatı" ||
+      cell === "satis fiyati"
+    ) {
+      columns.sell = index;
+    } else if (cell === "stok" || cell === "adet" || cell === "miktar") columns.stock = index;
     else if (
       cell === "ürün adı" ||
       cell === "urun adi" ||

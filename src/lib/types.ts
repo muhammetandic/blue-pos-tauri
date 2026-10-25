@@ -1,19 +1,24 @@
-/** Ürün. Fiyat ve stok tamsayıdır. */
+/** Ürün. Fiyat bilgisi `product_prices` tablosundan gelen güncel değerlerdir. */
 export interface Product {
   id: number;
   barcode: string | null;
   name: string;
-  /** Kuruş cinsinden. Tam sayı — asla float değil. */
-  price_cents: number;
+  /** Güncel maliyet, kuruş cinsinden. */
+  cost_cents: number;
+  /** Güncel satış fiyatı, kuruş cinsinden. */
+  sell_cents: number;
+  /** Güncel fiyat kaydının kimliği (`product_prices.id`). */
+  price_id: number | null;
   /** Negatif olabilir. */
   stock: number;
 }
 
-/** Yeni ürün oluştururken kullanılan tip. */
+/** Yeni ürün oluştururken / güncellerken kullanılan tip. */
 export interface ProductInput {
   barcode: string | null;
   name: string;
-  price_cents: number;
+  cost_cents: number;
+  sell_cents: number;
   stock: number;
 }
 
@@ -23,19 +28,33 @@ export interface CartLine {
   key: string;
   /** Bilinmeyen barkodla eklenen geçici satırlarda null. */
   product_id: number | null;
+  /** Sepete eklendiği andaki fiyat kaydı. */
+  price_id: number | null;
   name: string;
-  price_cents: number;
+  /** Satış fiyatı (kuruş). */
+  sell_cents: number;
   qty: number;
 }
 
 export type PaymentMethod = "nakit" | "kart" | "mobil";
 
+/** Fiyat geçmişi kaydı. */
+export interface PriceRecord {
+  id: number;
+  product_id: number;
+  cost_cents: number;
+  sell_cents: number;
+  created_at: string;
+}
+
 export interface SaleItem {
   id: number;
   sale_id: number;
   product_id: number | null;
+  /** Satıldığı andaki fiyat kaydı; geçmiş kayıtlarda bilinmiyorsa null. */
+  price_id: number | null;
   name: string;
-  price_cents: number;
+  sell_cents: number;
   qty: number;
 }
 
@@ -69,6 +88,6 @@ export interface ProductRow {
   id: number;
   barcode: string | null;
   name: string;
-  price_cents: number;
+  sell_cents: number;
   stock: number;
 }

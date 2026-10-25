@@ -9,20 +9,21 @@
 //! Doğrulama ve yazma `run_checkout` içinde toplanmıştır; havuz parametre
 //! olarak alındığı için iş mantığı penceresiz (GUI olmadan) test edilebilir.
 
+use crate::pool_of;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tauri::State;
-use tauri_plugin_sql::{DbInstances, DbPool};
-
-/// `tauri.conf.json` içindeki `plugins.sql.preload` değeriyle birebir aynı olmalıdır.
-const DB_URL: &str = "sqlite:pos.db";
+use tauri_plugin_sql::DbInstances;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CartLineIn {
     pub product_id: Option<i64>,
+    /// Satıldığı andaki fiyat kaydı (`product_prices.id`). Bilinmeyen
+    /// barkodla eklenen geçici satırlarda boştur.
+    pub price_id: Option<i64>,
     pub name: String,
-    pub price_cents: i64,
+    pub sell_cents: i64,
     pub qty: i64,
 }
 
@@ -45,15 +46,6 @@ pub struct CheckoutOutcome {
 
 type CmdResult<T> = Result<T, String>;
 
-/// Eklentinin peşin tanımladığı havuzu alır (tek bağlantı havuzu).
-async fn pool_of(instances: &DbInstances) -> CmdResult<SqlitePool> {
-    let map = instances.0.read().await;
-    match map.get(DB_URL) {
-        Some(DbPool::Sqlite(pool)) => Ok(pool.clone()),
-        _ => Err("Veritabanı hazır değil".to_string()),
-    }
-}
-
 /// Sepeti doğrular ve stok düşerek atomik olarak kaydeder.
 pub async fn run_checkout(pool: &SqlitePool, args: CheckoutArgs) -> CmdResult<CheckoutOutcome> {
     // ---- Doğrulama ------------------------------------------------------
@@ -69,14 +61,14 @@ pub async fn run_checkout(pool: &SqlitePool, args: CheckoutArgs) -> CmdResult<Ch
         if line.qty < 1 {
             return Err("Geçersiz ürün adedi".to_string());
         }
-        if line.price_cents < 0 {
+        if line.sell_cents < 0 {
             return Err("Geçersiz fiyat".to_string());
         }
         if line.name.trim().is_empty() {
             return Err("Ürün adı boş olamaz".to_string());
         }
         let line_total = line
-            .price_cents
+            .sell_cents
             .checked_mul(line.qty)
             .ok_or_else(|| "Tutar taşması".to_string())?;
         total = total
@@ -111,13 +103,14 @@ pub async fn run_checkout(pool: &SqlitePool, args: CheckoutArgs) -> CmdResult<Ch
 
     for line in &args.lines {
         sqlx::query(
-            "INSERT INTO sale_items (sale_id, product_id, name, price_cents, qty)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO sale_items (sale_id, product_id, price_id, name, sell_cents, qty)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(sale_id)
         .bind(line.product_id)
+        .bind(line.price_id)
         .bind(line.name.trim())
-        .bind(line.price_cents)
+        .bind(line.sell_cents)
         .bind(line.qty)
         .execute(&mut *tx)
         .await
@@ -157,83 +150,111 @@ pub async fn checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{
+        MIGRATION_V1, MIGRATION_V2, count, current_price, insert_product, price_count, stock_of,
+        test_pool,
+    };
 
-    const MIGRATION: &str = include_str!("../migrations/0001_init.sql");
+    fn line(
+        product_id: Option<i64>,
+        price_id: Option<i64>,
+        name: &str,
+        sell_cents: i64,
+        qty: i64,
+    ) -> CartLineIn {
+        CartLineIn {
+            product_id,
+            price_id,
+            name: name.to_string(),
+            sell_cents,
+            qty,
+        }
+    }
 
-    /// Bellekte tek bağlantılı havuz. `sqlite::memory:` her bağlantıya ayrı
-    /// veritabanı verdiği için bağlantı sayısı 1'e sabitlenir.
-    async fn test_pool() -> SqlitePool {
+    #[tokio::test]
+    async fn migrations_create_price_history_schema() {
+        let pool = test_pool().await;
+
+        let tables = count(
+            &pool,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('products','sales','sale_items','product_prices')",
+        )
+        .await;
+        assert_eq!(tables, 4);
+
+        // Fiyat artık products tablosunda değil.
+        let product_price_col = count(
+            &pool,
+            "SELECT COUNT(*) FROM pragma_table_info('products') WHERE name = 'price_cents'",
+        )
+        .await;
+        assert_eq!(product_price_col, 0);
+
+        // Satış kalemi sell_cents kullanır ve fiyat kaydına bağlanır.
+        let sell_col = count(
+            &pool,
+            "SELECT COUNT(*) FROM pragma_table_info('sale_items') WHERE name = 'sell_cents'",
+        )
+        .await;
+        assert_eq!(sell_col, 1);
+        let price_id_col = count(
+            &pool,
+            "SELECT COUNT(*) FROM pragma_table_info('sale_items') WHERE name = 'price_id'",
+        )
+        .await;
+        assert_eq!(price_id_col, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_seeds_existing_prices_as_first_record() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .expect("havuz açılamadı");
 
-        sqlx::raw_sql(MIGRATION)
+        sqlx::raw_sql(MIGRATION_V1)
             .execute(&pool)
             .await
-            .expect("migration uygulanamadı");
+            .expect("v1 uygulanamadı");
 
-        pool
-    }
-
-    async fn insert_product(pool: &SqlitePool, barcode: &str, name: &str, price: i64, stock: i64) -> i64 {
-        sqlx::query(
+        let product_id = sqlx::query(
             "INSERT INTO products (barcode, name, name_search, price_cents, stock)
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES ('8690001', 'Eski Ürün', 'eski urun', 1234, 5)",
         )
-        .bind(barcode)
-        .bind(name)
-        .bind(name)
-        .bind(price)
-        .bind(stock)
-        .execute(pool)
+        .execute(&pool)
         .await
         .expect("ürün eklenemedi")
-        .last_insert_rowid()
-    }
+        .last_insert_rowid();
 
-    async fn stock_of(pool: &SqlitePool, id: i64) -> i64 {
-        sqlx::query_scalar::<_, i64>("SELECT stock FROM products WHERE id = ?")
-            .bind(id)
-            .fetch_one(pool)
+        sqlx::raw_sql(MIGRATION_V2)
+            .execute(&pool)
             .await
-            .expect("stok okunamadı")
-    }
+            .expect("v2 uygulanamadı");
 
-    async fn count(pool: &SqlitePool, sql: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>(sql)
-            .fetch_one(pool)
-            .await
-            .expect("sayaç okunamadı")
-    }
-
-    fn line(product_id: Option<i64>, name: &str, price: i64, qty: i64) -> CartLineIn {
-        CartLineIn {
-            product_id,
-            name: name.to_string(),
-            price_cents: price,
-            qty,
-        }
-    }
-
-    #[tokio::test]
-    async fn migration_is_idempotent() {
-        let pool = test_pool().await;
-        // İkinci kez uygulanabilmeli (uygulama yeniden başladığında).
-        sqlx::raw_sql(MIGRATION).execute(&pool).await.expect("yeniden uygulama başarısız");
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('products','sales','sale_items')").await, 3);
+        // Maliyet geçmişte yoktu; 0 kabul edilir. Satış fiyatı korunur.
+        let (cost, sell) = current_price(&pool, product_id).await;
+        assert_eq!(cost, 0);
+        assert_eq!(sell, 1234);
+        assert_eq!(price_count(&pool, product_id).await, 1);
     }
 
     #[tokio::test]
     async fn checkout_records_sale_and_decrements_stock() {
         let pool = test_pool().await;
-        let product_id = insert_product(&pool, "8690001", "Çay 500g", 1250, 10).await;
+        let (product_id, price_id) = insert_product(&pool, "8690001", "Çay 500g", 1250, 10).await;
 
         let outcome = run_checkout(
             &pool,
             CheckoutArgs {
-                lines: vec![line(Some(product_id), "Çay 500g", 1250, 3)],
+                lines: vec![line(
+                    Some(product_id),
+                    Some(price_id),
+                    "Çay 500g",
+                    1250,
+                    3,
+                )],
                 method: "nakit".into(),
                 paid_cents: 5000,
                 reference: None,
@@ -260,17 +281,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(qty, 3);
+
+        // Satış kalemi, satıldığı andaki fiyat kaydına bağlanır.
+        let stored_price_id: Option<i64> =
+            sqlx::query_scalar("SELECT price_id FROM sale_items LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_price_id, Some(price_id));
     }
 
     #[tokio::test]
     async fn checkout_allows_negative_stock() {
         let pool = test_pool().await;
-        let product_id = insert_product(&pool, "8690002", "Stoklu Ürün", 1000, 1).await;
+        let (product_id, price_id) =
+            insert_product(&pool, "8690002", "Stoklu Ürün", 1000, 1).await;
 
         let outcome = run_checkout(
             &pool,
             CheckoutArgs {
-                lines: vec![line(Some(product_id), "Stoklu Ürün", 1000, 5)],
+                lines: vec![line(
+                    Some(product_id),
+                    Some(price_id),
+                    "Stoklu Ürün",
+                    1000,
+                    5,
+                )],
                 method: "kart".into(),
                 paid_cents: 5000,
                 reference: Some("POS-1234".into()),
@@ -288,12 +324,12 @@ mod tests {
     #[tokio::test]
     async fn checkout_rejects_insufficient_cash_and_writes_nothing() {
         let pool = test_pool().await;
-        let product_id = insert_product(&pool, "8690003", "Pahalı", 5000, 10).await;
+        let (product_id, price_id) = insert_product(&pool, "8690003", "Pahalı", 5000, 10).await;
 
         let err = run_checkout(
             &pool,
             CheckoutArgs {
-                lines: vec![line(Some(product_id), "Pahalı", 5000, 1)],
+                lines: vec![line(Some(product_id), Some(price_id), "Pahalı", 5000, 1)],
                 method: "nakit".into(),
                 paid_cents: 1000,
                 reference: None,
@@ -329,7 +365,7 @@ mod tests {
         let bad_method = run_checkout(
             &pool,
             CheckoutArgs {
-                lines: vec![line(None, "Geçici", 100, 1)],
+                lines: vec![line(None, None, "Geçici", 100, 1)],
                 method: "bitcoin".into(),
                 paid_cents: 100,
                 reference: None,
@@ -350,8 +386,8 @@ mod tests {
             &pool,
             CheckoutArgs {
                 lines: vec![
-                    line(None, "Bilinmeyen barkod 999", 0, 1),
-                    line(None, "Başka bilinmeyen", 0, 2),
+                    line(None, None, "Bilinmeyen barkod 999", 0, 1),
+                    line(None, None, "Başka bilinmeyen", 0, 2),
                 ],
                 method: "mobil".into(),
                 paid_cents: 0,
@@ -364,11 +400,12 @@ mod tests {
         assert_eq!(outcome.total_cents, 0);
         assert_eq!(outcome.change_cents, 0);
 
-        let nulls: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sale_items WHERE product_id IS NULL")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let nulls: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sale_items WHERE product_id IS NULL AND price_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(nulls, 2);
     }
 
@@ -378,11 +415,11 @@ mod tests {
 
         // product_id verilmiş ama ürün silinmişse (ON DELETE SET NULL)
         // satış satırının bağlantısı kopar, yazma hâlâ başarılı olur.
-        let product_id = insert_product(&pool, "8690009", "Silinen", 500, 5).await;
+        let (product_id, price_id) = insert_product(&pool, "8690009", "Silinen", 500, 5).await;
         run_checkout(
             &pool,
             CheckoutArgs {
-                lines: vec![line(Some(product_id), "Silinen", 500, 1)],
+                lines: vec![line(Some(product_id), Some(price_id), "Silinen", 500, 1)],
                 method: "nakit".into(),
                 paid_cents: 500,
                 reference: None,
@@ -397,11 +434,13 @@ mod tests {
             .await
             .expect("silme başarısız");
 
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sale_items WHERE product_id IS NULL")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        // Ürün silinince fiyat kaydı da düşer; satırdaki bağlantılar kopar.
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sale_items WHERE product_id IS NULL AND price_id IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(remaining, 1);
 
         // Aynı satış hâlâ duruyor.
@@ -417,8 +456,8 @@ mod tests {
 
         // products.ts: listProducts — arama sorgusu (iki yer tutucu)
         let rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM products
-             WHERE name_search LIKE ?1 OR barcode LIKE ?2",
+            "SELECT COUNT(*) FROM products p
+             WHERE p.name_search LIKE ?1 OR p.barcode LIKE ?2",
         )
         .bind("%cay%")
         .bind("%86901%")
@@ -428,37 +467,26 @@ mod tests {
         assert_eq!(rows, 2);
 
         // products.ts: findByBarcode — tek yer tutucu
-        let id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM products WHERE barcode = ?1 LIMIT 1",
-        )
-        .bind("8690101")
-        .fetch_optional(&pool)
-        .await
-        .expect("sorgu başarısız");
+        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM products WHERE barcode = ?1 LIMIT 1")
+            .bind("8690101")
+            .fetch_optional(&pool)
+            .await
+            .expect("sorgu başarısız");
         assert!(id.is_some());
 
-        // products.ts: barcodeTaken — koşullu iki yer tutucu
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM products WHERE barcode = ?1 AND id != ?2 LIMIT 1",
+        // Güncel fiyat sorgusu: en büyük id'li kayıt.
+        let price: i64 = sqlx::query_scalar(
+            "SELECT pp.sell_cents FROM products p
+             JOIN product_prices pp ON pp.id = (
+               SELECT id FROM product_prices WHERE product_id = p.id ORDER BY id DESC LIMIT 1
+             )
+             WHERE p.barcode = ?1",
         )
         .bind("8690101")
-        .bind(999)
-        .fetch_optional(&pool)
+        .fetch_one(&pool)
         .await
-        .expect("koşullu yer tutucu başarısız");
-        assert!(found.is_some());
-
-        // Aynı sorgu, kendisi hariç tutularak boş dönmeli.
-        let self_id: i64 = found.expect("ürün bulunmalı");
-        let dupe: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM products WHERE barcode = ?1 AND id != ?2 LIMIT 1",
-        )
-        .bind("8690101")
-        .bind(self_id)
-        .fetch_optional(&pool)
-        .await
-        .expect("koşullu yer tutucu başarısız");
-        assert!(dupe.is_none());
+        .expect("fiyat sorgusu başarısız");
+        assert_eq!(price, 3490);
     }
 
     /// Arayüzün sayı bağlama davranışını doğrular.
@@ -470,31 +498,41 @@ mod tests {
     async fn frontend_binds_numbers_as_f64_but_stores_integers() {
         let pool = test_pool().await;
 
-        sqlx::query(
-            "INSERT INTO products (barcode, name, name_search, price_cents, stock)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+        let product_id = sqlx::query(
+            "INSERT INTO products (barcode, name, name_search, stock)
+             VALUES (?1, ?2, ?3, ?4)",
         )
         .bind("8690500")
         .bind("Çay 500g")
         .bind("cay 500g")
-        .bind(1250.0_f64)
         .bind(20.0_f64)
         .execute(&pool)
         .await
-        .expect("eklenemedi");
+        .expect("eklenemedi")
+        .last_insert_rowid();
 
-        let price: i64 = sqlx::query_scalar("SELECT price_cents FROM products")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(price, 1250);
+        sqlx::query(
+            "INSERT INTO product_prices (product_id, cost_cents, sell_cents)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(product_id)
+        .bind(900.0_f64)
+        .bind(1250.0_f64)
+        .execute(&pool)
+        .await
+        .expect("fiyat eklenemedi");
 
-        let stock_type: String =
-            sqlx::query_scalar("SELECT typeof(price_cents) || '/' || typeof(stock) FROM products")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(stock_type, "integer/integer", "değerler INTEGER olarak saklanmalı");
+        let (cost, sell) = current_price(&pool, product_id).await;
+        assert_eq!(cost, 900);
+        assert_eq!(sell, 1250);
+
+        let types: String = sqlx::query_scalar(
+            "SELECT typeof(cost_cents) || '/' || typeof(sell_cents) FROM product_prices",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(types, "integer/integer", "değerler INTEGER olarak saklanmalı");
 
         // Negatif stok da aynı şekilde saklanabilmeli.
         sqlx::query("UPDATE products SET stock = ?1 WHERE id != ?2")

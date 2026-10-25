@@ -1,8 +1,24 @@
+import { invoke } from "@tauri-apps/api/core";
 import { getDb } from "../lib/db";
 import { foldForSearch } from "../lib/turkish";
-import type { Product, ProductInput } from "../lib/types";
+import type { PriceRecord, Product, ProductInput } from "../lib/types";
 
-const SELECT = "SELECT id, barcode, name, price_cents, stock FROM products";
+/**
+ * Güncel fiyat, ürüne ait en büyük `id` değerine sahip `product_prices`
+ * satırıdır. Fiyat geçmişi korunur; hiçbir kayıt güncellenmez.
+ */
+const SELECT = `
+  SELECT p.id, p.barcode, p.name, p.stock,
+         COALESCE(pp.cost_cents, 0) AS cost_cents,
+         COALESCE(pp.sell_cents, 0) AS sell_cents,
+         pp.id AS price_id
+  FROM products p
+  LEFT JOIN product_prices pp ON pp.id = (
+    SELECT id FROM product_prices
+    WHERE product_id = p.id
+    ORDER BY id DESC
+    LIMIT 1
+  )`;
 
 /**
  * Ürün listesi. Boş sorgu tüm ürünleri döner.
@@ -14,12 +30,12 @@ export async function listProducts(search: string): Promise<Product[]> {
   const db = await getDb();
   const term = search.trim();
   if (term === "") {
-    return db.select<Product[]>(`${SELECT} ORDER BY name COLLATE NOCASE`);
+    return db.select<Product[]>(`${SELECT} ORDER BY p.name COLLATE NOCASE`);
   }
   return db.select<Product[]>(
     `${SELECT}
-     WHERE name_search LIKE ?1 OR barcode LIKE ?2
-     ORDER BY name COLLATE NOCASE`,
+     WHERE p.name_search LIKE ?1 OR p.barcode LIKE ?2
+     ORDER BY p.name COLLATE NOCASE`,
     [`%${foldForSearch(term)}%`, `%${term}%`],
   );
 }
@@ -27,68 +43,74 @@ export async function listProducts(search: string): Promise<Product[]> {
 /** Tam barkodla tek ürün arar. Tarayıcı okutmada kullanılır. */
 export async function findByBarcode(barcode: string): Promise<Product | null> {
   const db = await getDb();
-  const rows = await db.select<Product[]>(`${SELECT} WHERE barcode = ?1 LIMIT 1`, [barcode.trim()]);
+  const rows = await db.select<Product[]>(`${SELECT} WHERE p.barcode = ?1 LIMIT 1`, [
+    barcode.trim(),
+  ]);
   return rows[0] ?? null;
 }
 
 export async function getProduct(id: number): Promise<Product | null> {
   const db = await getDb();
-  const rows = await db.select<Product[]>(`${SELECT} WHERE id = ?1 LIMIT 1`, [id]);
+  const rows = await db.select<Product[]>(`${SELECT} WHERE p.id = ?1 LIMIT 1`, [id]);
   return rows[0] ?? null;
 }
 
-/** Barkod zaten kullanılıyor mu? */
-async function barcodeTaken(barcode: string, exceptId?: number): Promise<boolean> {
+/** Bir ürünün fiyat geçmişi; en yeni kayıt önce gelir. */
+export async function listPriceHistory(productId: number): Promise<PriceRecord[]> {
   const db = await getDb();
-  const rows = await db.select<{ id: number }[]>(
-    `SELECT id FROM products WHERE barcode = ?1${exceptId ? " AND id != ?2" : ""} LIMIT 1`,
-    exceptId ? [barcode, exceptId] : [barcode],
+  return db.select<PriceRecord[]>(
+    `SELECT id, product_id, cost_cents, sell_cents, created_at
+     FROM product_prices
+     WHERE product_id = ?1
+     ORDER BY id DESC`,
+    [productId],
   );
-  return rows.length > 0;
 }
 
-function duplicateBarcode(barcode: string): Error {
-  return new Error(`Bu barkod zaten kayıtlı: ${barcode}`);
+/**
+ * Ürünü oluşturur veya günceller. Fiyat değiştiyse yeni bir fiyat kaydı
+ * eklenir. Ürün ve fiyat tek transaction'da yazıldığı için işlem Rust
+ * tarafında yürütülür (bkz. src-tauri/src/products.rs).
+ */
+export async function saveProduct(id: number | null, input: ProductInput): Promise<number> {
+  return invoke<number>("save_product", {
+    args: {
+      id,
+      product: {
+        barcode: input.barcode?.trim() || null,
+        name: input.name.trim(),
+        nameSearch: foldForSearch(input.name),
+        costCents: input.cost_cents,
+        sellCents: input.sell_cents,
+        stock: input.stock,
+      },
+    },
+  });
 }
 
 export async function createProduct(input: ProductInput): Promise<number> {
-  const db = await getDb();
-  const barcode = input.barcode?.trim() || null;
-  if (barcode !== null && (await barcodeTaken(barcode))) {
-    throw duplicateBarcode(barcode);
-  }
-  const result = await db.execute(
-    `INSERT INTO products (barcode, name, name_search, price_cents, stock)
-     VALUES (?1, ?2, ?3, ?4, ?5)`,
-    [barcode, input.name.trim(), foldForSearch(input.name), input.price_cents, input.stock],
-  );
-  return result.lastInsertId ?? 0;
+  return saveProduct(null, input);
 }
 
 export async function updateProduct(id: number, input: ProductInput): Promise<void> {
-  const db = await getDb();
-  const barcode = input.barcode?.trim() || null;
-  if (barcode !== null && (await barcodeTaken(barcode, id))) {
-    throw duplicateBarcode(barcode);
-  }
-  await db.execute(
-    `UPDATE products
-     SET barcode = ?1, name = ?2, name_search = ?3, price_cents = ?4, stock = ?5
-     WHERE id = ?6`,
-    [barcode, input.name.trim(), foldForSearch(input.name), input.price_cents, input.stock, id],
-  );
+  await saveProduct(id, input);
 }
 
+/**
+ * Ürünü siler. Fiyat geçmişi `ON DELETE CASCADE` ile temizlenir; satış
+ * kalemlerindeki bağlantılar `ON DELETE SET NULL` ile korunur.
+ */
 export async function deleteProduct(id: number): Promise<void> {
   const db = await getDb();
   await db.execute("DELETE FROM products WHERE id = ?1", [id]);
 }
 
-/** CSV satırı. Fiyat kuruş cinsinden işlenmiştir. */
+/** CSV satırı. Fiyatlar kuruş cinsinden işlenmiştir. */
 export interface CsvProduct {
   barcode: string | null;
   name: string;
-  price_cents: number;
+  cost_cents: number;
+  sell_cents: number;
   stock: number;
 }
 
@@ -112,7 +134,7 @@ export async function importProducts(rows: CsvProduct[]): Promise<ImportSummary>
       summary.errors.push("Ürün adı boş satır atlandı.");
       continue;
     }
-    if (row.price_cents < 0) {
+    if (row.cost_cents < 0 || row.sell_cents < 0) {
       summary.skipped += 1;
       summary.errors.push(`Geçersiz fiyat: ${row.name}`);
       continue;
@@ -122,7 +144,8 @@ export async function importProducts(rows: CsvProduct[]): Promise<ImportSummary>
     const input: ProductInput = {
       barcode: row.barcode,
       name: row.name.trim(),
-      price_cents: row.price_cents,
+      cost_cents: row.cost_cents,
+      sell_cents: row.sell_cents,
       stock: row.stock,
     };
 
